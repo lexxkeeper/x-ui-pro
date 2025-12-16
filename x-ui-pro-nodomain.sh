@@ -327,6 +327,12 @@ server {
 		proxy_pass http://127.0.0.1:${panel_port};
 		break;
 	}
+	include /etc/nginx/snippets/includes.conf;
+
+}
+EOF
+
+cat > "/etc/nginx/snippets/includes.conf" << EOF
   	#sub2sing-box
 	location /${sub2singbox_path}/ {
 		proxy_redirect off;
@@ -454,7 +460,6 @@ server {
 		}
 	}
 	location / { try_files \$uri \$uri/ =404; }
-}
 EOF
 
 cat > "/etc/nginx/sites-available/${reality_domain}" << EOF
@@ -493,115 +498,7 @@ server {
 		proxy_pass http://127.0.0.1:${panel_port};
 		break;
 	}
-  	#sub2sing-box
-	location /${sub2singbox_path}/ {
-		proxy_redirect off;
-		proxy_set_header Host \$host;
-		proxy_set_header X-Real-IP \$remote_addr;
-		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-		proxy_pass http://127.0.0.1:8080/;
-		}
-    # Path to open clash.yaml and generate YAML
-    location ~ ^/${web_path}/clashmeta/(.+)$ {
-        default_type text/plain;
-        ssi on;
-        ssi_types text/plain;
-        set \$subid \$1;
-        root /var/www/subpage;
-        try_files /clash.yaml =404;
-    }
-    # web
-    location ~ ^/${web_path} {
-        root /var/www/subpage;
-        index index.html;
-        try_files \$uri \$uri/ /index.html =404;
-    }
- 	#Subscription Path (simple/encode)
-        location /${sub_path} {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
-                break;
-        }
-	location /${sub_path}/ {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
-                break;
-        }
-	#Subscription Path (json/fragment)
-        location /${json_path} {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
-                break;
-        }
-	location /${json_path}/ {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
-                break;
-        }
-        #XHTTP
-        location /${xhttp_path} {
-          grpc_pass grpc://unix:/dev/shm/uds2023.sock;
-          grpc_buffer_size         16k;
-          grpc_socket_keepalive    on;
-          grpc_read_timeout        1h;
-          grpc_send_timeout        1h;
-          grpc_set_header Connection         "";
-          grpc_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
-          grpc_set_header X-Forwarded-Proto  \$scheme;
-          grpc_set_header X-Forwarded-Port   \$server_port;
-          grpc_set_header Host               \$host;
-          grpc_set_header X-Forwarded-Host   \$host;
-          }
- 	#Xray Config Path
-	location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
-	$CF_IP	if (\$cloudflare_ip != 1) {return 404;}
-		if (\$hack = 1) {return 404;}
-		client_max_body_size 0;
-		client_body_timeout 1d;
-		grpc_read_timeout 1d;
-		grpc_socket_keepalive on;
-		proxy_read_timeout 1d;
-		proxy_http_version 1.1;
-		proxy_buffering off;
-		proxy_request_buffering off;
-		proxy_socket_keepalive on;
-		proxy_set_header Upgrade \$http_upgrade;
-		proxy_set_header Connection "upgrade";
-		proxy_set_header Host \$host;
-		proxy_set_header X-Real-IP \$remote_addr;
-		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-		#proxy_set_header CF-IPCountry \$http_cf_ipcountry;
-		#proxy_set_header CF-IP \$realip_remote_addr;
-		if (\$content_type ~* "GRPC") {
-			grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args;
-			break;
-		}
-		if (\$http_upgrade ~* "(WEBSOCKET|WS)") {
-			proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
-			break;
-	        }
-		if (\$request_method ~* ^(PUT|POST|GET)\$) {
-			proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
-			break;
-		}
-	}
-	location / { try_files \$uri \$uri/ =404; }
+include /etc/nginx/snippets/includes.conf;
 }
 EOF
 ##################################Check Nginx status####################################################
