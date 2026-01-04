@@ -23,15 +23,16 @@ ln -s /etc/letsencrypt/live/${domain}/privkey.pem /root/cert/${domain}/privkey.p
 
 
 NGINX_CONF="/etc/nginx/sites-available/${domain}"
-BACKUP="/root/${domain}.backup.$(date +%F_%H%M%S)"
-cp -a "$NGINX_CONF" "$BACKUP"
 
-
+# normalize XUIPATH: remove leading/trailing slashes
 XUIPATH_NORM="${XUIPATH#/}"
 XUIPATH_NORM="${XUIPATH_NORM%/}"
 
+LOC1="/${XUIPATH_NORM}/"
+LOC2="/${XUIPATH_NORM}"
 
-read -r -d '' XUI_LOCATION_BODY <<EOF
+# тело location (8 пробелов как в nginx-конфиге)
+read -r -d '' XUI_BODY <<EOF
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -48,56 +49,74 @@ read -r -d '' XUI_LOCATION_BODY <<EOF
         break;
 EOF
 
+tmp="$(mktemp)"
 
-patch_location_block() {
-  local conf="$1"
-  local loc="$2"     
-  local body="$3"
-
-
-  local loc_re
-  loc_re="$(printf '%s' "$loc" | sed -e 's/[.[\*^$()+?{|\\]/\\&/g' -e 's/\//\\\//g')"
-
-
-  if perl -0777 -ne "exit(index(\$_, 'location ${loc} ') >= 0 ? 0 : 1)" "$conf"; then
-    perl -0777 -i -pe "
-      s/location\\s+${loc_re}\\s*\\{.*?\\n\\s*\\}/location ${loc} {\\n${body}\\n    }/sg
-    " "$conf"
-    return 0
-  fi
-
-  return 1
+awk -v loc1="$LOC1" -v loc2="$LOC2" -v body="$XUI_BODY" '
+function emit_location(loc) {
+  print "    location " loc " {"
+  n = split(body, a, "\n")
+  for (i=1; i<=n; i++) print a[i]
+  print "    }"
 }
 
-
-insert_location_block() {
-  local conf="$1"
-  local loc="$2"
-  local body="$3"
-
-  local block="    location ${loc} {\n${body}\n    }\n"
-
- 
-  if grep -qE '^\s*include\s+/etc/nginx/snippets/includes\.conf;' "$conf"; then
-    perl -0777 -i -pe "s/(\\n\\s*include\\s+\\/etc\\/nginx\\/snippets\\/includes\\.conf;)/\\n${block}\$1/s" "$conf"
-  else
-   
-    perl -0777 -i -pe "s/\\n\\}\\s*\$/\\n${block}\\n}\\n/s" "$conf"
-  fi
+BEGIN{
+  replaced1=0; replaced2=0;
+  inloc=0; depth=0; curr="";
+  inserted=0;
 }
 
+{
+  line=$0
 
-LOC1="/${XUIPATH_NORM}/"
-LOC2="/${XUIPATH_NORM}"
+  # если сейчас внутри целевого location — пропускаем до закрывающей }
+  if (inloc) {
+    # считаем скобки, чтобы корректно выйти на нужной }
+    for (i=1; i<=length(line); i++) {
+      c=substr(line,i,1)
+      if (c=="{") depth++
+      else if (c=="}") depth--
+    }
+    if (depth<=0) {
+      inloc=0
+      curr=""
+    }
+    next
+  }
 
-patch_location_block "$NGINX_CONF" "$LOC1" "$XUI_LOCATION_BODY" || insert_location_block "$NGINX_CONF" "$LOC1" "$XUI_LOCATION_BODY"
-patch_location_block "$NGINX_CONF" "$LOC2" "$XUI_LOCATION_BODY" || insert_location_block "$NGINX_CONF" "$LOC2" "$XUI_LOCATION_BODY"
+  # старт блока location /path/ {
+  if (match(line, "^[[:space:]]*location[[:space:]]+" loc1 "[[:space:]]*\\{")) {
+    emit_location(loc1); replaced1=1
+    inloc=1; depth=1
+    next
+  }
+  if (match(line, "^[[:space:]]*location[[:space:]]+" loc2 "[[:space:]]*\\{")) {
+    emit_location(loc2); replaced2=1
+    inloc=1; depth=1
+    next
+  }
 
+  # перед include — удобное место вставить, если не нашли location
+  if (!inserted && line ~ /^[[:space:]]*include[[:space:]]+\/etc\/nginx\/snippets\/includes\.conf;/) {
+    if (!replaced1) { emit_location(loc1); replaced1=1 }
+    if (!replaced2) { emit_location(loc2); replaced2=1 }
+    inserted=1
+    print line
+    next
+  }
 
-nginx -t && systemctl restart nginx
+  print line
+}
+
+END{
+  # если include не было — можно было бы вставить перед концом server{}.
+  # В этом варианте — просто оставляем как есть.
+}
+' "$NGINX_CONF" > "$tmp" && cat "$tmp" > "$NGINX_CONF" && rm -f "$tmp"
 
 
 /usr/local/x-ui/x-ui cert -webCert "/root/cert/${domain}/fullchain.pem" -webCertKey "/root/cert/${domain}/privkey.pem"
+
 x-ui restart
+nginx -t
 systemctl restart nginx
 
