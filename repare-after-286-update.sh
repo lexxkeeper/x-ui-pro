@@ -7,8 +7,8 @@ while true; do
 	echo -en "Enter your panel domain(sub.domain.tld): " && read domain 
 done
 
-XUIPORT=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
-XUIPATH=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
+XUIPORT=$(sqlite3 -list /etc/x-ui/x-ui.db 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
+XUIPATH=$(sqlite3 -list /etc/x-ui/x-ui.db 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
 
 mkdir -p /root/cert/${domain}
 chmod 755 /root/cert/*
