@@ -410,24 +410,6 @@ EOF
                 proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
-	location /assets/ {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
-                break;
-        }
-	location /assets {
-                if (\$hack = 1) {return 404;}
-                proxy_redirect off;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
-                break;
-        }
 	#Subscription Path (json/fragment)
         location /${json_path} {
                 if (\$hack = 1) {return 404;}
