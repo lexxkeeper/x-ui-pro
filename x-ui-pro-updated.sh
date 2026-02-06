@@ -268,8 +268,37 @@ server {
 EOF
 
 	grep -qF "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/nginx.conf || echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
-	grep -qF "load_module modules/ngx_stream_module.so;" /etc/nginx/nginx.conf || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
-	grep -qF "load_module modules/ngx_stream_geoip2_module.so;" /etc/nginx/nginx.conf || sed -i '2s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_geoip2_module.so; /' /etc/nginx/nginx.conf
+
+	# --- ngx_stream_module: load only if not already available ---
+	# The module may be: (a) compiled statically, (b) loaded via /etc/nginx/modules-enabled/,
+	# or (c) already present in nginx.conf from a previous run.  Adding a duplicate load_module
+	# causes "module is already loaded" and Nginx refuses to start.
+	if nginx -V 2>&1 | grep -q -- '--with-stream\b'; then
+		msg_inf "stream module is compiled statically, skipping load_module"
+	elif ls /etc/nginx/modules-enabled/*stream* &>/dev/null; then
+		msg_inf "stream module already enabled via modules-enabled, skipping load_module"
+	elif grep -qF "load_module" /etc/nginx/nginx.conf 2>/dev/null \
+	     && grep -qF "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then
+		msg_inf "stream module already loaded in nginx.conf, skipping"
+	elif [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
+		sed -i '1s|^|load_module /usr/lib/nginx/modules/ngx_stream_module.so; \n|' /etc/nginx/nginx.conf
+		msg_inf "stream module loaded dynamically via load_module"
+	else
+		warn "ngx_stream_module.so not found and stream not built-in; install libnginx-mod-stream"
+	fi
+
+	# --- ngx_stream_geoip2_module: same logic ---
+	if ls /etc/nginx/modules-enabled/*geoip2* &>/dev/null; then
+		msg_inf "stream geoip2 module already enabled via modules-enabled, skipping"
+	elif grep -qF "ngx_stream_geoip2_module" /etc/nginx/nginx.conf 2>/dev/null; then
+		msg_inf "stream geoip2 module already loaded in nginx.conf, skipping"
+	elif [[ -f /usr/lib/nginx/modules/ngx_stream_geoip2_module.so ]]; then
+		sed -i '1s|^|load_module /usr/lib/nginx/modules/ngx_stream_geoip2_module.so; \n|' /etc/nginx/nginx.conf
+		msg_inf "stream geoip2 module loaded dynamically via load_module"
+	else
+		warn "ngx_stream_geoip2_module.so not found; geoip2 filtering will not work"
+	fi
+
 	grep -qF "worker_rlimit_nofile 16384;" /etc/nginx/nginx.conf || echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
 	sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
 
