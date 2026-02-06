@@ -1,282 +1,247 @@
 #!/bin/bash
 #################### x-ui-pro v2.4.3 @ github.com/GFW4Fun ##############################################
-[[ $EUID -ne 0 ]] && echo "not root!" && sudo su -
-##############################INFO######################################################################
-msg_ok() { echo -e "\e[1;42m $1 \e[0m";}
-msg_err() { echo -e "\e[1;41m $1 \e[0m";}
-msg_inf() { echo -e "\e[1;34m$1\e[0m";}
-echo;msg_inf '           ___    _   _   _  '	;
-msg_inf		 ' \/ __ | |  | __ |_) |_) / \ '	;
-msg_inf		 ' /\    |_| _|_   |   | \ \_/ '	; echo
-##################################OS & CPU Preflight Check#############################################
-PREFLIGHT_FAIL=0
+set -o pipefail
+trap '(( $? )) && printf "[ERROR] Script exited with code %d\n" "$?" >&2' EXIT
 
-# --- OS version check: Ubuntu >= 24 or Debian 12/13 ---
-if [[ -f /etc/os-release ]]; then
+##############################Constants##################################################################
+XUIDB="/etc/x-ui/x-ui.db"
+IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
+IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
+PKG_MGR=$(type apt &>/dev/null && echo "apt" || echo "yum")
+
+# Color codes used by install_panel()
+green='\033[0;32m'
+red='\033[0;31m'
+yellow='\033[0;33m'
+blue='\033[0;34m'
+plain='\033[0m'
+
+##############################Message Helpers#############################################################
+msg_ok()  { printf '\e[1;42m %s \e[0m\n' "$1"; }
+msg_err() { printf '\e[1;41m %s \e[0m\n' "$1"; }
+msg_inf() { printf '\e[1;34m%s\e[0m\n' "$1"; }
+die()     { msg_err "$1"; exit "${2:-1}"; }
+warn()    { printf '\e[1;33mWARN: %s\e[0m\n' "$1" >&2; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+##############################Root Check##################################################################
+ensure_root() {
+	if [[ $EUID -ne 0 ]]; then
+		msg_inf "Not root, re-executing with sudo..."
+		exec sudo -E bash "$0" "$@"
+	fi
+}
+ensure_root "$@"
+
+##############################Banner######################################################################
+show_banner() {
+	echo
+	msg_inf '           ___    _   _   _  '
+	msg_inf ' \/ __ | |  | __ |_) |_) / \ '
+	msg_inf ' /\    |_| _|_   |   | \ \_/ '
+	echo
+}
+show_banner
+
+##############################OS & CPU Preflight Check####################################################
+check_os() {
+	if [[ ! -f /etc/os-release ]]; then
+		msg_err "Cannot detect OS: /etc/os-release not found."
+		return 1
+	fi
 	. /etc/os-release
-	os_id="${ID,,}"
-	os_ver="${VERSION_ID%%.*}"
-	case "$os_id" in
+	OS_ID="${ID,,}"
+	local os_ver="${VERSION_ID%%.*}"
+	case "$OS_ID" in
 		ubuntu)
 			if [[ -n "$os_ver" ]] && (( os_ver < 24 )); then
 				msg_err "Unsupported OS: Ubuntu $VERSION_ID detected. Ubuntu 24+ is required. Please upgrade your OS."
-				PREFLIGHT_FAIL=1
+				return 1
 			fi
 			;;
 		debian)
 			if [[ -n "$os_ver" ]] && (( os_ver < 12 )); then
 				msg_err "Unsupported OS: Debian $VERSION_ID detected. Debian 12 or 13 is required. Please upgrade your OS."
-				PREFLIGHT_FAIL=1
+				return 1
 			fi
 			;;
 		*)
 			msg_err "Unsupported OS: $PRETTY_NAME. Only Ubuntu 24+ and Debian 12/13 are supported."
-			PREFLIGHT_FAIL=1
+			return 1
 			;;
 	esac
-else
-	msg_err "Cannot detect OS: /etc/os-release not found."
-	PREFLIGHT_FAIL=1
-fi
+	return 0
+}
 
-# --- CPU model check: reject QEMU virtual CPU ---
-CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
-if [[ "$CPU_MODEL" == *"QEMU"* ]]; then
-	msg_err "QEMU virtual CPU detected ($CPU_MODEL). Please contact your hosting provider's support and request changing the CPU model to host CPU."
-	PREFLIGHT_FAIL=1
-fi
+check_cpu() {
+	local cpu_model
+	cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+	if [[ "$cpu_model" == *"QEMU"* ]]; then
+		msg_err "QEMU virtual CPU detected ($cpu_model). Please contact your hosting provider's support and request changing the CPU model to host CPU."
+		return 1
+	fi
+	return 0
+}
 
-if (( PREFLIGHT_FAIL )); then
-	msg_err "Preflight checks failed. Exiting."
-	exit 1
-fi
-##################################Variables#############################################################
-XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=1;CFALLOW="n";CLASH=0;CUSTOMWEBSUB=0
-Pak=$(type apt &>/dev/null && echo "apt" || echo "yum")
-systemctl stop x-ui
-rm -rf /etc/systemd/system/x-ui.service
-rm -rf /usr/local/x-ui
-rm -rf /etc/x-ui
-rm -rf /etc/nginx/sites-enabled/*
-rm -rf /etc/nginx/sites-available/*
-rm -rf /etc/nginx/stream-enabled/*
+preflight_checks() {
+	local fail=0
+	check_os  || fail=1
+	check_cpu || fail=1
+	if (( fail )); then
+		die "Preflight checks failed. Exiting."
+	fi
+	# Initialize release for install_panel() Alpine checks
+	release="$OS_ID"
+}
+preflight_checks
 
+##############################IP Detection################################################################
+detect_ips() {
+	IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
+	[[ "$IP4" =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
+	IP6=$(ip route get 2620:fe::fe 2>&1 | grep -Po -- 'src \K\S*')
+	[[ "$IP6" =~ $IP6_REGEX ]] || IP6=$(curl -s ipv6.icanhazip.com | tr -d '[:space:]')
+}
 
-##################################generate ports and paths#############################################################
-get_port() {
+resolve_to_ip() {
+	local host="$1"
+	local a
+	a=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+	[[ -n "$a" ]] && [[ "$a" == "$IP4" ]]
+}
+
+##############################Port & String Generators####################################################
+get_random_port() {
 	echo $(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
 }
 
 gen_random_string() {
-    local length="$1"
-    head -c 4096 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
-    echo
+	local length="$1"
+	head -c 4096 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
+	echo
 }
-check_free() {
-	local port=$1
-	nc -z 127.0.0.1 $port &>/dev/null
-	return $?
+
+port_in_use() {
+	local port="$1"
+	nc -z 127.0.0.1 "$port" &>/dev/null
 }
 
 make_port() {
+	local p
 	while true; do
-		PORT=$(get_port)
-		if ! check_free $PORT; then 
-			echo $PORT
+		p=$(get_random_port)
+		if ! port_in_use "$p"; then
+			echo "$p"
 			break
 		fi
 	done
 }
 
-sub_port=$(make_port)
-panel_port=$(make_port)
-web_path=$(gen_random_string 10)
-sub2singbox_path=$(gen_random_string 10)
-sub_path=$(gen_random_string 10)
-json_path=$(gen_random_string 10)
-panel_path=$(gen_random_string 10)
-ws_port=$(make_port)
-trojan_port=$(make_port)
-ws_path=$(gen_random_string 10)
-trojan_path=$(gen_random_string 10)
-xhttp_path=$(gen_random_string 10)
-config_username=$(gen_random_string 10)
-config_password=$(gen_random_string 10)
-AUTODOMAIN="n"
+##############################Architecture Detection######################################################
+arch() {
+	case "$(uname -m)" in
+		x86_64 | x64 | amd64) echo 'amd64' ;;
+		i*86 | x86) echo '386' ;;
+		armv8* | armv8 | arm64 | aarch64) echo 'arm64' ;;
+		armv7* | armv7 | arm) echo 'armv7' ;;
+		armv6* | armv6) echo 'armv6' ;;
+		armv5* | armv5) echo 'armv5' ;;
+		s390x) echo 's390x' ;;
+		*) printf '%bUnsupported CPU architecture!%b\n' "${green}" "${plain}" && exit 1 ;;
+	esac
+}
 
-##################################Random Port and Path #################################################
-#RNDSTR=$(tr -dc A-Za-z0-9 </dev/urandom | head -c "$(shuf -i 6-12 -n 1)")
-#while true; do 
-#    PORT=$(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
-#    status="$(nc -z 127.0.0.1 $PORT < /dev/null &>/dev/null; echo $?)"
-#    if [ "${status}" != "0" ]; then
-#        break
-#    fi
-#done
+##############################Sysctl Idempotent Writer#####################################################
+sysctl_ensure() {
+	local key="$1" value="$2"
+	local entry="$key=$value"
+	if grep -q "^${key}[[:space:]]*=" /etc/sysctl.conf 2>/dev/null; then
+		sed -i "s|^${key}[[:space:]]*=.*|${entry}|" /etc/sysctl.conf
+	else
+		echo "$entry" >> /etc/sysctl.conf
+	fi
+}
 
-################################Get arguments###########################################################
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -auto_domain) AUTODOMAIN="$2"; shift 2;;
-    -install) INSTALL="$2"; shift 2;;
-    -panel) PNLNUM="$2"; shift 2;;
-    -subdomain) domain="$2"; shift 2;;
-    -reality_domain) reality_domain="$2"; shift 2;;
-    -ONLY_CF_IP_ALLOW) CFALLOW="$2"; shift 2;;
-    -websub) CUSTOMWEBSUB="$2"; shift 2;;
-    -clash) CLASH="$2"; shift 2;;
-    -uninstall) UNINSTALL="$2"; shift 2;;
-    *) shift 1;;
-  esac
-done
+##############################Argument Parsing############################################################
+parse_args() {
+	domain=""
+	UNINSTALL="x"
+	INSTALL="n"
+	PNLNUM=1
+	CFALLOW="n"
+	CLASH=0
+	CUSTOMWEBSUB=0
+	AUTODOMAIN="n"
 
+	while [[ "$#" -gt 0 ]]; do
+		case "$1" in
+			-auto_domain) AUTODOMAIN="$2"; shift 2;;
+			-install) INSTALL="$2"; shift 2;;
+			-panel) PNLNUM="$2"; shift 2;;
+			-subdomain) domain="$2"; shift 2;;
+			-reality_domain) reality_domain="$2"; shift 2;;
+			-ONLY_CF_IP_ALLOW) CFALLOW="$2"; shift 2;;
+			-websub) CUSTOMWEBSUB="$2"; shift 2;;
+			-clash) CLASH="$2"; shift 2;;
+			-uninstall) UNINSTALL="$2"; shift 2;;
+			*) shift 1;;
+		esac
+	done
+}
 
-##############################Uninstall#################################################################
-UNINSTALL_XUI(){
+##############################Uninstall###################################################################
+uninstall_xui() {
 	printf 'y\n' | x-ui uninstall
 	rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
-	$Pak -y remove nginx nginx-common nginx-core nginx-full python3-certbot-nginx
-	$Pak -y purge nginx nginx-common nginx-core nginx-full python3-certbot-nginx
-	$Pak -y autoremove
-	$Pak -y autoclean
-	rm -rf "/var/www/html/" "/etc/nginx/" "/usr/share/nginx/" 
-}
-if [[ ${UNINSTALL} == *"y"* ]]; then
-	UNINSTALL_XUI	
-	clear && msg_ok "Completely Uninstalled!" && exit 1
-fi
-
-
-# --- get public IPv4 early (for auto-domain mode)
-IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
-IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
-[[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
-
-
-if [[ ${AUTODOMAIN} == *"y"* ]]; then
-    # panel domain: x.x.x.x.cdn-one.org
-    domain="${IP4}.cdn-one.org"
-
-    # reality domain: x-x-x-x.cdn-one.org
-    reality_domain="${IP4//./-}.cdn-one.org"
-fi
-
-
-##############################Domain Validations########################################################
-while true; do	
-	if [[ -n "$domain" ]]; then
-		break
-	fi
-	echo -en "Enter available subdomain (sub.domain.tld): " && read domain 
-done
-
-domain=$(echo "$domain" 2>&1 | tr -d '[:space:]' )
-SubDomain=$(echo "$domain" 2>&1 | sed 's/^[^ ]* \|\..*//g')
-MainDomain=$(echo "$domain" 2>&1 | sed 's/.*\.\([^.]*\..*\)$/\1/')
-
-if [[ "${SubDomain}.${MainDomain}" != "${domain}" ]] ; then
-	MainDomain=${domain}
-fi
-
-while true; do	
-	if [[ -n "$reality_domain" ]]; then
-		break
-	fi
-	echo -en "Enter available subdomain for REALITY (sub.domain.tld): " && read reality_domain 
-done
-
-reality_domain=$(echo "$reality_domain" 2>&1 | tr -d '[:space:]' )
-RealitySubDomain=$(echo "$reality_domain" 2>&1 | sed 's/^[^ ]* \|\..*//g')
-RealityMainDomain=$(echo "$reality_domain" 2>&1 | sed 's/.*\.\([^.]*\..*\)$/\1/')
-
-if [[ "${RealitySubDomain}.${RealityMainDomain}" != "${reality_domain}" ]] ; then
-	RealityMainDomain=${reality_domain}
-fi
-
-###############################Install Packages#########################################################
-ufw disable
-if [[ ${INSTALL} == *"y"* ]]; then
-
-         version=$(grep -oP '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
-
-         # Проверяем, является ли версия 20 или 22
-        if [[ "$version" == "20" || "$version" == "22" ]]; then
-              echo "Версия системы: Ubuntu $version"
-        fi
-
-	$Pak -y update
-
-	$Pak -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw
-
-	systemctl daemon-reload && systemctl enable --now nginx
-fi
-systemctl stop nginx 
-fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null
-##################################GET SERVER IPv4-6#####################################################
-IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
-IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
-IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
-IP6=$(ip route get 2620:fe::fe 2>&1 | grep -Po -- 'src \K\S*')
-[[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com);
-[[ $IP6 =~ $IP6_REGEX ]] || IP6=$(curl -s ipv6.icanhazip.com);
-##############################Install SSL###############################################################
-
-resolve_to_ip () {
-    local host="$1"
-    # get first A-record
-    local a
-    a=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
-    [[ -n "$a" ]] && [[ "$a" == "$IP4" ]]
+	"$PKG_MGR" -y remove nginx nginx-common nginx-core nginx-full python3-certbot-nginx
+	"$PKG_MGR" -y purge nginx nginx-common nginx-core nginx-full python3-certbot-nginx
+	"$PKG_MGR" -y autoremove
+	"$PKG_MGR" -y autoclean
+	rm -rf "/var/www/html/" "/etc/nginx/" "/usr/share/nginx/"
 }
 
-if [[ ${AUTODOMAIN} == *"y"* ]]; then
-    if ! resolve_to_ip "$domain"; then
-        msg_err "Auto-domain $domain does not resolve to this server IP ($IP4). Fix DNS/service and retry."
-        exit 1
-    fi
-    if ! resolve_to_ip "$reality_domain"; then
-        msg_err "Auto-domain $reality_domain does not resolve to this server IP ($IP4). Fix DNS/service and retry."
-        exit 1
-    fi
-fi
+##############################Clean Previous Install######################################################
+clean_previous_install() {
+	systemctl stop x-ui 2>/dev/null
+	rm -rf /etc/systemd/system/x-ui.service
+	rm -rf /usr/local/x-ui
+	rm -rf /etc/x-ui
+	rm -rf /etc/nginx/sites-enabled/*
+	rm -rf /etc/nginx/sites-available/*
+	rm -rf /etc/nginx/stream-enabled/*
+}
 
+##############################Install Packages############################################################
+install_packages() {
+	if [[ "${INSTALL}" == *"y"* ]]; then
+		"$PKG_MGR" -y update
+		"$PKG_MGR" -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw
+		systemctl daemon-reload && systemctl enable --now nginx
+	fi
+	systemctl stop nginx
+	fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null
+}
 
-certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"
-if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
- 	systemctl start nginx >/dev/null 2>&1
-	msg_err "$domain SSL could not be generated! Check Domain/IP Or Enter new domain!" && exit 1
-fi
+##############################SSL Helper##################################################################
+obtain_ssl() {
+	local cert_domain="$1"
+	certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain"
+	if [[ ! -d "/etc/letsencrypt/live/${cert_domain}/" ]]; then
+		systemctl start nginx >/dev/null 2>&1
+		die "$cert_domain SSL could not be generated! Check Domain/IP Or Enter new domain!"
+	fi
+}
 
-certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$reality_domain"
-if [[ ! -d "/etc/letsencrypt/live/${reality_domain}/" ]]; then
- 	systemctl start nginx >/dev/null 2>&1
-	msg_err "$reality_domain SSL could not be generated! Check Domain/IP Or Enter new domain!" && exit 1
-fi
-################################# Access to configs only with cloudflare#################################
+##############################Nginx Config################################################################
+setup_nginx() {
+	mkdir -p "/root/cert/${domain}"
+	chmod 700 /root/cert/*
 
-###################################Get Installed XUI Port/Path##########################################
-if [[ -f $XUIDB ]]; then
-	XUIPORT=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
-	XUIPATH=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
-if [[ $XUIPORT -gt 0 && $XUIPORT != "54321" && $XUIPORT != "2053" ]] && [[ ${#XUIPORT} -gt 4 ]]; then
-	RNDSTR=$(echo "$XUIPATH" 2>&1 | tr -d '/')
-	PORT=$XUIPORT
-	sqlite3 $XUIDB <<EOF
-	DELETE FROM "settings" WHERE ( "key"="webCertFile" ) OR ( "key"="webKeyFile" ); 
-	INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  "");
-	INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile", "");
-EOF
-fi
-fi
-#################################Nginx Config###########################################################
-mkdir -p /root/cert/${domain}
-chmod 755 /root/cert/*
+	ln -sf "/etc/letsencrypt/live/${domain}/fullchain.pem" "/root/cert/${domain}/fullchain.pem"
+	ln -sf "/etc/letsencrypt/live/${domain}/privkey.pem" "/root/cert/${domain}/privkey.pem"
 
-ln -s /etc/letsencrypt/live/${domain}/fullchain.pem /root/cert/${domain}/fullchain.pem
-ln -s /etc/letsencrypt/live/${domain}/privkey.pem /root/cert/${domain}/privkey.pem
-
-mkdir -p /etc/nginx/stream-enabled
-cat > "/etc/nginx/stream-enabled/stream.conf" << EOF
+	mkdir -p /etc/nginx/stream-enabled
+	cat > "/etc/nginx/stream-enabled/stream.conf" << EOF
 map \$ssl_preread_server_name \$sni_name {
     hostnames;
     ${reality_domain}      xray;
@@ -302,12 +267,13 @@ server {
 
 EOF
 
-grep -xqFR "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/* ||echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
-grep -xqFR "load_module modules/ngx_stream_module.so;" /etc/nginx/* || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
-grep -xqFR "load_module modules/ngx_stream_geoip2_module.so;" /etc/nginx* || sed -i '2s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_geoip2_module.so; /' /etc/nginx/nginx.conf
-grep -xqFR "worker_rlimit_nofile 16384;" /etc/nginx/* ||echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
-sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
-cat > "/etc/nginx/sites-available/80.conf" << EOF
+	grep -qF "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/nginx.conf || echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
+	grep -qF "load_module modules/ngx_stream_module.so;" /etc/nginx/nginx.conf || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
+	grep -qF "load_module modules/ngx_stream_geoip2_module.so;" /etc/nginx/nginx.conf || sed -i '2s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_geoip2_module.so; /' /etc/nginx/nginx.conf
+	grep -qF "worker_rlimit_nofile 16384;" /etc/nginx/nginx.conf || echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
+	sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
+
+	cat > "/etc/nginx/sites-available/80.conf" << EOF
 server {
     listen 80;
     server_name ${domain} ${reality_domain};
@@ -315,8 +281,7 @@ server {
 }
 EOF
 
-
-cat > "/etc/nginx/sites-available/${domain}" << EOF
+	cat > "/etc/nginx/sites-available/${domain}" << EOF
 server {
 	server_tokens off;
 	server_name ${domain};
@@ -373,7 +338,7 @@ server {
 }
 EOF
 
-cat > "/etc/nginx/snippets/includes.conf" << EOF
+	cat > "/etc/nginx/snippets/includes.conf" << EOF
   	#sub2sing-box
 	location /${sub2singbox_path}/ {
 		proxy_redirect off;
@@ -502,7 +467,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
 	location / { try_files \$uri \$uri/ =404; }
 EOF
 
-cat > "/etc/nginx/sites-available/${reality_domain}" << EOF
+	cat > "/etc/nginx/sites-available/${reality_domain}" << EOF
 server {
 	server_tokens off;
 	server_name ${reality_domain};
@@ -541,33 +506,47 @@ server {
 include /etc/nginx/snippets/includes.conf;
 }
 EOF
-##################################Check Nginx status####################################################
-if [[ -f "/etc/nginx/sites-available/${domain}" ]]; then
-	unlink "/etc/nginx/sites-enabled/default" >/dev/null 2>&1
-	rm -f "/etc/nginx/sites-enabled/default" "/etc/nginx/sites-available/default"
-	ln -s "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/" 2>/dev/null
-        ln -s "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/" 2>/dev/null
-	ln -s "/etc/nginx/sites-available/80.conf" "/etc/nginx/sites-enabled/" 2>/dev/null
-else
-	msg_err "${domain} nginx config not exist!" && exit 1
-fi
+}
 
-if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
-    msg_err "nginx config is not ok!" && exit 1
-else
-	systemctl start nginx 
-fi
+##############################Enable Nginx Sites##########################################################
+enable_nginx_sites() {
+	if [[ -f "/etc/nginx/sites-available/${domain}" ]]; then
+		unlink "/etc/nginx/sites-enabled/default" >/dev/null 2>&1
+		rm -f "/etc/nginx/sites-enabled/default" "/etc/nginx/sites-available/default"
+		ln -sf "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/"
+		ln -sf "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/"
+		ln -sf "/etc/nginx/sites-available/80.conf" "/etc/nginx/sites-enabled/"
+	else
+		die "${domain} nginx config not exist!"
+	fi
 
+	if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
+		die "nginx config is not ok!"
+	else
+		systemctl start nginx
+	fi
+}
 
-##############################generate uri's###########################################################
-sub_uri=https://${domain}/${sub_path}/
-json_uri=https://${domain}/${web_path}?name=
-##############################generate keys###########################################################
-shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
+##############################Read Existing XUI DB########################################################
+read_existing_xui_db() {
+	if [[ -f "$XUIDB" ]]; then
+		XUIPORT=$(sqlite3 -list "$XUIDB" 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
+		XUIPATH=$(sqlite3 -list "$XUIDB" 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
+		if [[ "$XUIPORT" -gt 0 && "$XUIPORT" != "54321" && "$XUIPORT" != "2053" ]] && [[ ${#XUIPORT} -gt 4 ]]; then
+			RNDSTR=$(echo "$XUIPATH" 2>&1 | tr -d '/')
+			PORT=$XUIPORT
+			sqlite3 "$XUIDB" <<EOF
+	DELETE FROM "settings" WHERE ( "key"="webCertFile" ) OR ( "key"="webKeyFile" );
+	INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  "");
+	INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile", "");
+EOF
+		fi
+	fi
+}
 
-########################################Update X-UI Port/Path for first INSTALL#########################
-UPDATE_XUIDB(){
-if [[ -f $XUIDB ]]; then
+##############################Update XUI DB###############################################################
+update_xui_db() {
+if [[ -f "$XUIDB" ]]; then
         x-ui stop
         output=$(/usr/local/x-ui/bin/xray-linux-amd64 x25519)
 
@@ -579,7 +558,15 @@ if [[ -f $XUIDB ]]; then
         client_id3=$(/usr/local/x-ui/bin/xray-linux-amd64 uuid)
 	trojan_pass=$(gen_random_string 10)
         emoji_flag=$(LC_ALL=en_US.UTF-8 curl -s https://ipwho.is/ | jq -r '.flag.emoji')
-       	sqlite3 $XUIDB <<EOF
+
+	# Generate shortIds via loop
+	local shor=()
+	local i
+	for i in {1..8}; do
+		shor+=("$(openssl rand -hex 8)")
+	done
+
+       	sqlite3 "$XUIDB" <<EOF
              INSERT INTO "settings" ("key", "value") VALUES ("subPort",  '${sub_port}');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subPath",  '/${sub_path}/');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subURI",  '${sub_uri}');
@@ -622,7 +609,7 @@ if [[ -f $XUIDB ]]; then
 	     INSERT INTO "client_traffics" ("inbound_id","enable","email","up","down","expiry_time","total","reset") VALUES ('2','1','first_1','0','0','0','0','0');
 		   INSERT INTO "client_traffics" ("inbound_id","enable","email","up","down","expiry_time","total","reset") VALUES ('3','1','firstX','0','0','0','0','0');
 	     INSERT INTO "client_traffics" ("inbound_id","enable","email","up","down","expiry_time","total","reset") VALUES ('4','1','firstT','0','0','0','0','0');
-             INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ( 
+             INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
              '1',
 	     '0',
              '0',
@@ -713,7 +700,7 @@ if [[ -f $XUIDB ]]; then
   "routeOnly": false
 }'
 	     );
-      INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ( 
+      INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
              '1',
 	     '0',
              '0',
@@ -775,7 +762,7 @@ if [[ -f $XUIDB ]]; then
   "routeOnly": false
 }'
 	     );
-      INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ( 
+      INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
              '1',
 	     '0',
              '0',
@@ -858,7 +845,7 @@ if [[ -f $XUIDB ]]; then
   "routeOnly": false
 }'
 	     );
-	INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ( 
+	INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
 	     '1',
 	     '0',
          '0',
@@ -923,106 +910,96 @@ EOF
 /usr/local/x-ui/x-ui cert -webCert "/root/cert/${domain}/fullchain.pem" -webCertKey "/root/cert/${domain}/privkey.pem"
 x-ui start
 else
-	msg_err "x-ui.db file not exist! Maybe x-ui isn't installed." && exit 1;
+	die "x-ui.db file not exist! Maybe x-ui isn't installed."
 fi
 }
-arch() {
-    case "$(uname -m)" in
-        x86_64 | x64 | amd64) echo 'amd64' ;;
-        i*86 | x86) echo '386' ;;
-        armv8* | armv8 | arm64 | aarch64) echo 'arm64' ;;
-        armv7* | armv7 | arm) echo 'armv7' ;;
-        armv6* | armv6) echo 'armv6' ;;
-        armv5* | armv5) echo 'armv5' ;;
-        s390x) echo 's390x' ;;
-        *) echo -e "${green}Unsupported CPU architecture! ${plain}" && rm -f install.sh && exit 1 ;;
-    esac
-}
 
+##############################Config After Install########################################################
 config_after_install() {
-            /usr/local/x-ui/x-ui setting -username "asdfasdf" -password "asdfasdf" -port "2096" -webBasePath "asdfasdf"    
-            /usr/local/x-ui/x-ui migrate
+	/usr/local/x-ui/x-ui setting -username "asdfasdf" -password "asdfasdf" -port "2096" -webBasePath "asdfasdf"
+	/usr/local/x-ui/x-ui migrate
 }
 
+##############################Install Panel###############################################################
 install_panel() {
 apt-get update && apt-get install -y -q wget curl tar tzdata
     cd /usr/local/
-    
+
     # Download resources
     if [ $# == 0 ]; then
         tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ ! -n "$tag_version" ]]; then
-            echo -e "${yellow}Trying to fetch version with IPv4...${plain}"
+            printf '%bTrying to fetch version with IPv4...%b\n' "${yellow}" "${plain}"
             tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
             if [[ ! -n "$tag_version" ]]; then
-                echo -e "${red}Failed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later${plain}"
+                printf '%bFailed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later%b\n' "${red}" "${plain}"
                 exit 1
             fi
         fi
         echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
         wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
         if [[ $? -ne 0 ]]; then
-            echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
+            printf '%bDownloading x-ui failed, please be sure that your server can access GitHub%b\n' "${red}" "${plain}"
             exit 1
         fi
     else
         tag_version=$1
         tag_version_numeric=${tag_version#v}
         min_version="2.3.5"
-        
+
         if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
-            echo -e "${red}Please use a newer version (at least v2.3.5). Exiting installation.${plain}"
+            printf '%bPlease use a newer version (at least v2.3.5). Exiting installation.%b\n' "${red}" "${plain}"
             exit 1
         fi
-        
+
         url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
         echo -e "Beginning to install x-ui $1"
         wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz ${url}
         if [[ $? -ne 0 ]]; then
-            echo -e "${red}Download x-ui $1 failed, please check if the version exists ${plain}"
+            printf '%bDownload x-ui %s failed, please check if the version exists%b\n' "${red}" "$1" "${plain}"
             exit 1
         fi
     fi
     wget -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
     if [[ $? -ne 0 ]]; then
-        echo -e "${red}Failed to download x-ui.sh${plain}"
+        printf '%bFailed to download x-ui.sh%b\n' "${red}" "${plain}"
         exit 1
     fi
-    
+
     # Stop x-ui service and remove old resources
     if [[ -e /usr/local/x-ui/ ]]; then
-        if [[ $release == "alpine" ]]; then
+        if [[ "$release" == "alpine" ]]; then
             rc-service x-ui stop
         else
             systemctl stop x-ui
         fi
         rm /usr/local/x-ui/ -rf
     fi
-    
+
     # Extract resources and set permissions
     tar zxvf x-ui-linux-$(arch).tar.gz
     rm x-ui-linux-$(arch).tar.gz -f
-    
+
     cd x-ui
     chmod +x x-ui
     chmod +x x-ui.sh
-    
+
     # Check the system's architecture and rename the file accordingly
     if [[ $(arch) == "armv5" || $(arch) == "armv6" || $(arch) == "armv7" ]]; then
         mv bin/xray-linux-$(arch) bin/xray-linux-arm
         chmod +x bin/xray-linux-arm
     fi
     chmod +x x-ui bin/xray-linux-$(arch)
-    
+
     # Update x-ui cli and se set permission
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
     chmod +x /usr/bin/x-ui
 	config_after_install
-    
-    if [[ $release == "alpine" ]]; then
+
+    if [[ "$release" == "alpine" ]]; then
         wget --inet4-only -O /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc
         if [[ $? -ne 0 ]]; then
-            echo -e "${red}Failed to download x-ui.rc${plain}"
+            printf '%bFailed to download x-ui.rc%b\n' "${red}" "${plain}"
             exit 1
         fi
         chmod +x /etc/init.d/x-ui
@@ -1034,152 +1011,290 @@ apt-get update && apt-get install -y -q wget curl tar tzdata
         systemctl enable x-ui
         systemctl start x-ui
     fi
-    
-    echo -e "${green}x-ui ${tag_version}${plain} installation finished, it is running now..."
+
+    printf '%bx-ui %s%b installation finished, it is running now...\n' "${green}" "${tag_version}" "${plain}"
     echo -e ""
-    echo -e "┌───────────────────────────────────────────────────────┐
-│  ${blue}x-ui control menu usages (subcommands):${plain}              │
+    printf '┌───────────────────────────────────────────────────────┐
+│  %bx-ui control menu usages (subcommands):%b              │
 │                                                       │
-│  ${blue}x-ui${plain}              - Admin Management Script          │
-│  ${blue}x-ui start${plain}        - Start                            │
-│  ${blue}x-ui stop${plain}         - Stop                             │
-│  ${blue}x-ui restart${plain}      - Restart                          │
-│  ${blue}x-ui status${plain}       - Current Status                   │
-│  ${blue}x-ui settings${plain}     - Current Settings                 │
-│  ${blue}x-ui enable${plain}       - Enable Autostart on OS Startup   │
-│  ${blue}x-ui disable${plain}      - Disable Autostart on OS Startup  │
-│  ${blue}x-ui log${plain}          - Check logs                       │
-│  ${blue}x-ui banlog${plain}       - Check Fail2ban ban logs          │
-│  ${blue}x-ui update${plain}       - Update                           │
-│  ${blue}x-ui legacy${plain}       - Legacy version                   │
-│  ${blue}x-ui install${plain}      - Install                          │
-│  ${blue}x-ui uninstall${plain}    - Uninstall                        │
-└───────────────────────────────────────────────────────┘"
+│  %bx-ui%b              - Admin Management Script          │
+│  %bx-ui start%b        - Start                            │
+│  %bx-ui stop%b         - Stop                             │
+│  %bx-ui restart%b      - Restart                          │
+│  %bx-ui status%b       - Current Status                   │
+│  %bx-ui settings%b     - Current Settings                 │
+│  %bx-ui enable%b       - Enable Autostart on OS Startup   │
+│  %bx-ui disable%b      - Disable Autostart on OS Startup  │
+│  %bx-ui log%b          - Check logs                       │
+│  %bx-ui banlog%b       - Check Fail2ban ban logs          │
+│  %bx-ui update%b       - Update                           │
+│  %bx-ui legacy%b       - Legacy version                   │
+│  %bx-ui install%b      - Install                          │
+│  %bx-ui uninstall%b    - Uninstall                        │
+└───────────────────────────────────────────────────────┘\n' \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}" \
+    "${blue}" "${plain}"
 
 }
-###################################Install X-UI#########################################################
-if systemctl is-active --quiet x-ui; then
-	x-ui restart
-else
-    install_panel	
-	UPDATE_XUIDB
-	if ! systemctl is-enabled --quiet x-ui; then
-		systemctl daemon-reload && systemctl enable x-ui.service
+
+##############################Tune System#################################################################
+tune_system() {
+	apt-get install -yqq --no-install-recommends ca-certificates
+	sysctl_ensure "net.core.default_qdisc" "fq"
+	sysctl_ensure "net.ipv4.tcp_congestion_control" "bbr"
+	sysctl_ensure "fs.file-max" "2097152"
+	sysctl_ensure "net.ipv4.tcp_timestamps" "1"
+	sysctl_ensure "net.ipv4.tcp_sack" "1"
+	sysctl_ensure "net.ipv4.tcp_window_scaling" "1"
+	sysctl_ensure "net.core.rmem_max" "16777216"
+	sysctl_ensure "net.core.wmem_max" "16777216"
+	sysctl_ensure "net.ipv4.tcp_rmem" "4096 87380 16777216"
+	sysctl_ensure "net.ipv4.tcp_wmem" "4096 65536 16777216"
+	sysctl -p
+}
+
+##############################Install sub2sing-box########################################################
+install_sub2singbox() {
+	if pgrep -x "sub2sing-box" > /dev/null; then
+		echo "kill sub2sing-box..."
+		pkill -x "sub2sing-box"
 	fi
-	x-ui restart
-fi
+	if [ -f "/usr/bin/sub2sing-box" ]; then
+		echo "delete sub2sing-box..."
+		rm -f /usr/bin/sub2sing-box
+	fi
+	wget -P /root/ https://github.com/legiz-ru/sub2sing-box/releases/download/v0.0.9/sub2sing-box_0.0.9_linux_amd64.tar.gz
+	tar -xvzf /root/sub2sing-box_0.0.9_linux_amd64.tar.gz -C /root/ --strip-components=1 sub2sing-box_0.0.9_linux_amd64/sub2sing-box
+	mv /root/sub2sing-box /usr/bin/
+	chmod +x /usr/bin/sub2sing-box
+	rm /root/sub2sing-box_0.0.9_linux_amd64.tar.gz
+	su -c "/usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 & disown" root
+}
 
-######################enable bbr and tune system########################################################
-apt-get install -yqq --no-install-recommends ca-certificates
-echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
-echo "fs.file-max=2097152" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_timestamps = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_sack = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_window_scaling = 1" | tee -a /etc/sysctl.conf
-echo "net.core.rmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.core.wmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_rmem = 4096 87380 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_wmem = 4096 65536 16777216" | tee -a /etc/sysctl.conf
+##############################Install Fake Site###########################################################
+install_fake_site() {
+	bash <(wget -qO- https://raw.githubusercontent.com/mozaroc/x-ui-pro/refs/heads/master/randomfakehtml.sh)
+}
 
-sysctl -p
-
-
-######################install_sub2sing-box#################################################################
-
-if pgrep -x "sub2sing-box" > /dev/null; then
-    echo "kill sub2sing-box..."
-    pkill -x "sub2sing-box"
-fi
-if [ -f "/usr/bin/sub2sing-box" ]; then
-    echo "delete sub2sing-box..."
-    rm -f /usr/bin/sub2sing-box
-fi
-wget -P /root/ https://github.com/legiz-ru/sub2sing-box/releases/download/v0.0.9/sub2sing-box_0.0.9_linux_amd64.tar.gz
-tar -xvzf /root/sub2sing-box_0.0.9_linux_amd64.tar.gz -C /root/ --strip-components=1 sub2sing-box_0.0.9_linux_amd64/sub2sing-box
-mv /root/sub2sing-box /usr/bin/
-chmod +x /usr/bin/sub2sing-box
-rm /root/sub2sing-box_0.0.9_linux_amd64.tar.gz
-su -c "/usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 & disown" root
-
-######################install_fake_site#################################################################
-
-sudo su -c "bash <(wget -qO- https://raw.githubusercontent.com/mozaroc/x-ui-pro/refs/heads/master/randomfakehtml.sh)"
-
-######################install_web_sub_page##############################################################
-
-URL_SUB_PAGE=( "https://github.com/legiz-ru/x-ui-pro/raw/master/sub-3x-ui.html"
+##############################Install Web Sub Page########################################################
+install_web_sub_page() {
+	local URL_SUB_PAGE=(
+		"https://github.com/legiz-ru/x-ui-pro/raw/master/sub-3x-ui.html"
 		"https://github.com/legiz-ru/x-ui-pro/raw/master/sub-3x-ui-classical.html"
 	)
-URL_CLASH_SUB=( "https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash.yaml"
+	local URL_CLASH_SUB=(
+		"https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash.yaml"
 		"https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash_skrepysh.yaml"
 		"https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash_fullproxy_without_ru.yaml"
-  		"https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash_refilter_ech.yaml"
+		"https://github.com/legiz-ru/x-ui-pro/raw/master/clash/clash_refilter_ech.yaml"
 	)
-DEST_DIR_SUB_PAGE="/var/www/subpage"
-DEST_FILE_SUB_PAGE="$DEST_DIR_SUB_PAGE/index.html"
-DEST_FILE_CLASH_SUB="$DEST_DIR_SUB_PAGE/clash.yaml"
+	local DEST_DIR_SUB_PAGE="/var/www/subpage"
+	local DEST_FILE_SUB_PAGE="$DEST_DIR_SUB_PAGE/index.html"
+	local DEST_FILE_CLASH_SUB="$DEST_DIR_SUB_PAGE/clash.yaml"
 
-sudo mkdir -p "$DEST_DIR_SUB_PAGE"
+	mkdir -p "$DEST_DIR_SUB_PAGE"
 
-sudo curl -L "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB"
-sudo curl -L "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE"
+	curl -L "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB"
+	curl -L "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE"
 
-sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_SUB_PAGE"
-sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_CLASH_SUB"
-sed -i "s#\${SUB_JSON_PATH}#$json_path#g" "$DEST_FILE_SUB_PAGE"
-sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_SUB_PAGE"
-sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_CLASH_SUB"
-sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
+	sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_SUB_PAGE"
+	sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_CLASH_SUB"
+	sed -i "s#\${SUB_JSON_PATH}#$json_path#g" "$DEST_FILE_SUB_PAGE"
+	sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_SUB_PAGE"
+	sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_CLASH_SUB"
+	sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
+}
 
-#while true; do	
-#	if [[ -n "$tg_escaped_link" ]]; then
-#		break
-#	fi
-#	echo -en "Enter your support link for web sub page (example https://t.me/durov/ ): " && read tg_escaped_link
-#done
+##############################Setup Crontab###############################################################
+setup_crontab() {
+	crontab -l | grep -v "certbot\|x-ui\|cloudflareips\|sub2sing-box" | crontab -
+	(crontab -l 2>/dev/null; echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1') | crontab -
+	(crontab -l 2>/dev/null; echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload;') | crontab -
+	(crontab -l 2>/dev/null; echo '@monthly certbot renew --nginx --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1;') | crontab -
+}
 
-#sed -i -e "s|https://t.me/gozargah_marzban|$tg_escaped_link|g" -e "s|https://github.com/Gozargah/Marzban#donation|$tg_escaped_link|g" "$DEST_FILE_SUB_PAGE"
+##############################Setup UFW###################################################################
+setup_ufw() {
+	ufw disable
+	ufw allow 22/tcp
+	ufw allow 80/tcp
+	ufw allow 443/tcp
+	ufw --force enable
+}
 
-######################cronjob for ssl/reload service/cloudflareips######################################
-crontab -l | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
-(crontab -l 2>/dev/null; echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1') | crontab -
-(crontab -l 2>/dev/null; echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload;') | crontab -
-(crontab -l 2>/dev/null; echo '@monthly certbot renew --nginx --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1;') | crontab -
-##################################ufw###################################################################
-ufw disable
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable  
-##################################Show Details##########################################################
+##############################Show Details#################################################################
+show_details() {
+	if systemctl is-active --quiet x-ui; then
+		clear
+		printf '0\n' | x-ui | grep --color=never -i ':'
+		msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+		nginx -T | grep -i 'ssl_certificate\|ssl_certificate_key'
+		msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+		certbot certificates | grep -i 'Path:\|Domains:\|Expiry Date:'
+		msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+		msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/"
+		printf '\n'
+		printf 'Username:  %s\n\n' "${config_username}"
+		printf 'Password:  %s\n\n' "${config_password}"
+		msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+		msg_inf "Web Sub Page your first client: https://${domain}/${web_path}?name=first"
+		printf '\n'
+		msg_inf "Your local sub2sing-box instance: https://${domain}/$sub2singbox_path/"
+		printf '\n'
+		msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+		msg_inf "Please Save this Screen!!"
+	else
+		nginx -t && printf '0\n' | x-ui | grep --color=never -i ':'
+		msg_err "sqlite and x-ui to be checked, try on a new clean linux! "
+	fi
+}
 
-if systemctl is-active --quiet x-ui; then clear
-	printf '0\n' | x-ui | grep --color=never -i ':'
-	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-	nginx -T | grep -i 'ssl_certificate\|ssl_certificate_key'
-	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-	certbot certificates | grep -i 'Path:\|Domains:\|Expiry Date:'
+##############################Main########################################################################
+main() {
+	# 1. Parse arguments BEFORE any destructive action
+	parse_args "$@"
 
-#	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-#	if [[ -n $IP4 ]] && [[ "$IP4" =~ $IP4_REGEX ]]; then 
-#		msg_inf "IPv4: http://$IP4:$PORT/$RNDSTR/"
-#	fi
-#	if [[ -n $IP6 ]] && [[ "$IP6" =~ $IP6_REGEX ]]; then 
-#		msg_inf "IPv6: http://[$IP6]:$PORT/$RNDSTR/"
-#	fi
+	# 2. Handle uninstall early (no wipe needed)
+	if [[ "${UNINSTALL}" == *"y"* ]]; then
+		uninstall_xui
+		clear && msg_ok "Completely Uninstalled!"
+		exit 0
+	fi
 
- msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-	msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
- 	echo -e "Username:  ${config_username} \n" 
-	echo -e "Password:  ${config_password} \n" 
-	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-    msg_inf "Web Sub Page your first client: https://${domain}/${web_path}?name=first\n"
-    msg_inf "Your local sub2sing-box instance: https://${domain}/$sub2singbox_path/\n"
-  msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-	msg_inf "Please Save this Screen!!"	
-else
-	nginx -t && printf '0\n' | x-ui | grep --color=never -i ':'
-	msg_err "sqlite and x-ui to be checked, try on a new clean linux! "
-fi
+	# 3. Detect IPs (needed for auto-domain)
+	detect_ips
+
+	# 4. Auto-domain setup
+	if [[ "${AUTODOMAIN}" == *"y"* ]]; then
+		domain="${IP4}.cdn-one.org"
+		reality_domain="${IP4//./-}.cdn-one.org"
+	fi
+
+	# 5. Domain prompts
+	while true; do
+		if [[ -n "$domain" ]]; then
+			break
+		fi
+		printf "Enter available subdomain (sub.domain.tld): " && read domain
+	done
+
+	domain=$(echo "$domain" 2>&1 | tr -d '[:space:]')
+	SubDomain=$(echo "$domain" 2>&1 | sed 's/^[^ ]* \|\..*//g')
+	MainDomain=$(echo "$domain" 2>&1 | sed 's/.*\.\([^.]*\..*\)$/\1/')
+
+	if [[ "${SubDomain}.${MainDomain}" != "${domain}" ]]; then
+		MainDomain=${domain}
+	fi
+
+	while true; do
+		if [[ -n "$reality_domain" ]]; then
+			break
+		fi
+		printf "Enter available subdomain for REALITY (sub.domain.tld): " && read reality_domain
+	done
+
+	reality_domain=$(echo "$reality_domain" 2>&1 | tr -d '[:space:]')
+	RealitySubDomain=$(echo "$reality_domain" 2>&1 | sed 's/^[^ ]* \|\..*//g')
+	RealityMainDomain=$(echo "$reality_domain" 2>&1 | sed 's/.*\.\([^.]*\..*\)$/\1/')
+
+	if [[ "${RealitySubDomain}.${RealityMainDomain}" != "${reality_domain}" ]]; then
+		RealityMainDomain=${reality_domain}
+	fi
+
+	# 6. NOW do destructive cleanup (after args parsed, uninstall handled)
+	clean_previous_install
+
+	# 7. Generate random ports and paths
+	sub_port=$(make_port)
+	panel_port=$(make_port)
+	web_path=$(gen_random_string 10)
+	sub2singbox_path=$(gen_random_string 10)
+	sub_path=$(gen_random_string 10)
+	json_path=$(gen_random_string 10)
+	panel_path=$(gen_random_string 10)
+	ws_port=$(make_port)
+	trojan_port=$(make_port)
+	ws_path=$(gen_random_string 10)
+	trojan_path=$(gen_random_string 10)
+	xhttp_path=$(gen_random_string 10)
+	config_username=$(gen_random_string 10)
+	config_password=$(gen_random_string 10)
+
+	# 8. Install packages & disable UFW initially
+	ufw disable 2>/dev/null
+	install_packages
+
+	# 9. Auto-domain DNS verification
+	if [[ "${AUTODOMAIN}" == *"y"* ]]; then
+		if ! resolve_to_ip "$domain"; then
+			die "Auto-domain $domain does not resolve to this server IP ($IP4). Fix DNS/service and retry."
+		fi
+		if ! resolve_to_ip "$reality_domain"; then
+			die "Auto-domain $reality_domain does not resolve to this server IP ($IP4). Fix DNS/service and retry."
+		fi
+	fi
+
+	# 10. Obtain SSL certificates (DRY)
+	obtain_ssl "$domain"
+	obtain_ssl "$reality_domain"
+
+	# 11. Read existing XUI DB (if upgrading)
+	read_existing_xui_db
+
+	# 12. Setup nginx configs
+	setup_nginx
+	enable_nginx_sites
+
+	# 13. Generate URIs
+	sub_uri="https://${domain}/${sub_path}/"
+	json_uri="https://${domain}/${web_path}?name="
+
+	# 14. Install or restart X-UI panel
+	if systemctl is-active --quiet x-ui; then
+		x-ui restart
+	else
+		install_panel
+		update_xui_db
+		if ! systemctl is-enabled --quiet x-ui; then
+			systemctl daemon-reload && systemctl enable x-ui.service
+		fi
+		x-ui restart
+	fi
+
+	# 15. Tune system (idempotent sysctl)
+	tune_system
+
+	# 16. Install sub2sing-box
+	install_sub2singbox
+
+	# 17. Install fake site
+	install_fake_site
+
+	# 18. Install web sub page
+	install_web_sub_page
+
+	# 19. Setup crontab
+	setup_crontab
+
+	# 20. Setup UFW
+	setup_ufw
+
+	# 21. Show details
+	show_details
+}
+
+main "$@"
 #################################################N-joy##################################################
